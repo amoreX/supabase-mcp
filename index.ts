@@ -1,23 +1,25 @@
 #!/usr/bin/env node
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import express from "express";
 import cors from "cors";
 import { z } from "zod";
 import * as bcrypt from "bcryptjs";
 import { createClient } from "@supabase/supabase-js";
 import * as dotenv from "dotenv";
+import { randomUUID } from "node:crypto";
 
 // Load environment variables
 dotenv.config();
 
 // Initialize Supabase client
-const supabaseUrl = "https://fyhwbvtutrlenkwjiffi.supabase.co";
+const supabaseUrl = process.env.SUPABASE_URL || "https://fyhwbvtutrlenkwjiffi.supabase.co";
 const supabaseKey =
-  "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImZ5aHdidnR1dHJsZW5rd2ppZmZpIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NDY4OTg5ODMsImV4cCI6MjA2MjQ3NDk4M30.o0u2JLKF8sxBzEP4VCCQIOjb8KKkxn7UyOltV8qo5vI";
+  process.env.SUPABASE_KEY || "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImZ5aHdidnR1dHJsZW5rd2ppZmZpIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NDY4OTg5ODMsImV4cCI6MjA2MjQ3NDk4M30.o0u2JLKF8sxBzEP4VCCQIOjb8KKlKqn7UyOltV8qo5vI";
 
 if (!supabaseUrl || !supabaseKey) {
-  throw new Error("Missing required Supabase environment variables");
+  throw new Error("Missing required Supabase environment variables (SUPABASE_URL, SUPABASE_KEY)");
 }
 
 const supabase = createClient(supabaseUrl, supabaseKey);
@@ -521,153 +523,38 @@ server.resource("users", "users://list", async (uri) => {
   }
 });
 
+
 // Create Express app for HTTP transport
 const app = express();
 
 // Security middleware
 app.use(cors({
-  origin: true, // You should restrict this in production
+  origin: true, // IMPORTANT: For production, change 'true' to specific allowed origins.
   credentials: true
 }));
 
 app.use(express.json());
 
-// Session management
-const sessions = new Map<string, any>();
+// **MCP HTTP Transport Setup**
+const httpTransport = new StreamableHTTPServerTransport({
+  sessionIdGenerator: () => randomUUID(), // Use crypto.randomUUID() for secure session IDs
+  // onsessioninitialized: (sessionId) => console.log(`New MCP session: ${sessionId}`),
+  // enableJsonResponse: false, // Default: prefers SSE. Set to true for JSON-only responses
+  // eventStore: new YourCustomEventStore(), // Optional: for resumability
+});
 
-function generateSessionId(): string {
-  return crypto.randomUUID();
-}
+// !!! CRUCIAL FIX !!!
+// Connect the McpServer to the transport. The server will now handle incoming messages
+// from the transport automatically. No need to manually set httpTransport.onmessage.
+server.connect(httpTransport)
+  .then(() => console.log("MCP Server successfully connected to HTTP transport."))
+  .catch(error => console.error("Failed to connect MCP Server to HTTP transport:", error));
 
-function validateOrigin(req: express.Request): boolean {
-  // Basic origin validation - enhance this for production
-  const origin = req.get('origin');
-  // Allow requests without origin (e.g., server-to-server)
-  if (!origin) return true;
-  
-  // You should implement proper origin validation here
-  return true;
-}
 
 // MCP HTTP endpoint
-app.all('/mcp', async (req: express.Request, res: express.Response) => {
-  // Validate origin for security
-  if (!validateOrigin(req)) {
-    return res.status(403).json({ error: 'Forbidden origin' });
-  }
-
-  const sessionId = req.get('Mcp-Session-Id');
-  
-  if (req.method === 'POST') {
-    try {
-      const accept = req.get('accept') || '';
-      
-      if (!accept.includes('application/json') && !accept.includes('text/event-stream')) {
-        return res.status(400).json({ error: 'Invalid Accept header' });
-      }
-
-      const message = req.body;
-      
-      // Handle initialization specially
-      if (message.method === 'initialize') {
-        const result = await server.handleRequest(message);
-        const newSessionId = generateSessionId();
-        sessions.set(newSessionId, { initialized: true });
-        
-        res.set('Mcp-Session-Id', newSessionId);
-        res.set('Content-Type', 'application/json');
-        return res.json(result);
-      }
-      
-      // Validate session for non-initialization requests
-      if (sessionId && !sessions.has(sessionId)) {
-        return res.status(404).json({ error: 'Session not found' });
-      }
-      
-      // Handle other MCP messages
-      if (Array.isArray(message)) {
-        // Batch request
-        const hasRequests = message.some(msg => msg.method && !msg.result && !msg.error);
-        
-        if (hasRequests) {
-          // Use SSE for requests
-          res.set('Content-Type', 'text/event-stream');
-          res.set('Cache-Control', 'no-cache');
-          res.set('Connection', 'keep-alive');
-          
-          const results = [];
-          for (const msg of message) {
-            if (msg.method) {
-              const result = await server.handleRequest(msg);
-              results.push(result);
-            }
-          }
-          
-          res.write(`data: ${JSON.stringify(results)}\n\n`);
-          res.end();
-        } else {
-          // Only notifications/responses
-          return res.status(202).send();
-        }
-      } else {
-        // Single message
-        if (message.method && !message.result && !message.error) {
-          // Request - use either JSON or SSE based on Accept header
-          if (accept.includes('text/event-stream')) {
-            res.set('Content-Type', 'text/event-stream');
-            res.set('Cache-Control', 'no-cache');
-            res.set('Connection', 'keep-alive');
-            
-            const result = await server.handleRequest(message);
-            res.write(`data: ${JSON.stringify(result)}\n\n`);
-            res.end();
-          } else {
-            const result = await server.handleRequest(message);
-            res.json(result);
-          }
-        } else {
-          // Notification or response
-          return res.status(202).send();
-        }
-      }
-    } catch (error) {
-      console.error('MCP request error:', error);
-      res.status(500).json({ 
-        error: 'Internal server error',
-        message: error instanceof Error ? error.message : 'Unknown error'
-      });
-    }
-  } else if (req.method === 'GET') {
-    // SSE stream for server-initiated messages
-    const accept = req.get('accept') || '';
-    
-    if (!accept.includes('text/event-stream')) {
-      return res.status(405).json({ error: 'Method Not Allowed' });
-    }
-    
-    res.set('Content-Type', 'text/event-stream');
-    res.set('Cache-Control', 'no-cache');
-    res.set('Connection', 'keep-alive');
-    
-    // Keep connection alive with periodic heartbeat
-    const heartbeat = setInterval(() => {
-      res.write(': heartbeat\n\n');
-    }, 30000);
-    
-    req.on('close', () => {
-      clearInterval(heartbeat);
-    });
-    
-  } else if (req.method === 'DELETE') {
-    // Session termination
-    if (sessionId && sessions.has(sessionId)) {
-      sessions.delete(sessionId);
-      return res.status(200).send();
-    }
-    return res.status(404).json({ error: 'Session not found' });
-  } else {
-    res.status(405).json({ error: 'Method Not Allowed' });
-  }
+// This will use the handleRequest method of the StreamableHTTPServerTransport instance
+app.all('/mcp', async (req, res) => {
+  await httpTransport.handleRequest(req, res, req.body);
 });
 
 // Health check endpoint
@@ -676,7 +563,7 @@ app.get('/health', (req, res) => {
 });
 
 // Start the server
-const PORT = process.env.PORT || 3000;
+const PORT = parseInt(process.env.PORT || '3000', 10);
 
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`MCP HTTP Server running on port ${PORT}`);
