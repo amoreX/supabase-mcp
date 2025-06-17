@@ -5,8 +5,8 @@
     "typescript": "^5.8.3"
   },
   "scripts": {
-    "start": "npx tsx src/index.ts",
-    "dev": "npx tsx --watch src/index.ts",
+    "start": "npx tsx index.ts",
+    "dev": "npx tsx --watch index.ts",
     "build": "tsc",
     "serve": "node dist/index.js"
   },
